@@ -23,14 +23,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ── App lifecycle ────────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup: load model. Shutdown: cleanup."""
     logger.info("Starting SpatialDecide Engine...")
     engine = get_engine()
-    # Pre-load the model on startup
     try:
         engine._model.load()
         logger.info("Model pre-loaded successfully")
@@ -40,8 +38,6 @@ async def lifespan(app: FastAPI):
     logger.info("Shutting down SpatialDecide Engine...")
 
 
-# ── App creation ─────────────────────────────────────────────────────────────
-
 app = FastAPI(
     title="SpatialDecide Engine",
     description="Inference & Decision Core for spatial layout scoring and validation",
@@ -49,7 +45,6 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=os.getenv("CORS_ORIGINS", "*").split(","),
@@ -58,8 +53,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-# ── Health ───────────────────────────────────────────────────────────────────
 
 @app.get("/health")
 async def health_check() -> dict[str, str | bool]:
@@ -71,8 +64,6 @@ async def health_check() -> dict[str, str | bool]:
         "model_id": engine._model.model_id,
     }
 
-
-# ── Decision endpoints ────────────────────────────────────────────────────────
 
 @app.post("/api/v1/score", response_model=DecisionResponse)
 async def score_layouts(request: DecisionRequest) -> DecisionResponse:
@@ -89,8 +80,6 @@ async def validate_layout(request: ValidationRequest) -> ValidationResponse:
     engine = get_engine()
     return engine.validate_layout(request)
 
-
-# ── Model info ───────────────────────────────────────────────────────────────
 
 @app.get("/v1/models")
 async def list_models() -> dict:
@@ -111,22 +100,15 @@ async def list_models() -> dict:
 
 
 @app.get("/api/v1/model/info")
-async def model_info() -> dict[str, str | bool | list[str]]:
+async def model_info() -> dict[str, str | bool]:
     """Get information about the loaded model."""
     engine = get_engine()
     model = engine._model
-    info: dict[str, str | bool | list[str]] = {
+    return {
         "model_id": model.model_id,
         "loaded": model.is_loaded,
     }
-    if model.is_loaded and model._model is not None:
-        config = model._model.config
-        info["labels"] = list(config.id2label.values()) if config.id2label else []
-        info["num_labels"] = config.num_labels
-    return info
 
-
-# ── Run ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import uvicorn

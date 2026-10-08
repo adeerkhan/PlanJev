@@ -1,8 +1,4 @@
-"""LitServe API for the Laya decision model.
-
-This module exposes the model as a high-throughput LitServe endpoint
-for integration with the FastAPI app or external consumers.
-"""
+"""LitServe API for the Laya decision model."""
 
 from __future__ import annotations
 
@@ -26,74 +22,35 @@ class LayaDecisionAPI(ls.LitAPI):
         self._model.load()
         logger.info("Model ready for inference")
 
-    def decode_request(self, request: dict[str, Any]) -> str:
-        """Extract the prompt from the incoming request."""
-        prompt = request.get("prompt", "")
-        if not prompt:
-            raise ValueError("Request must contain a 'prompt' field")
-        return prompt
+    def decode_request(self, request: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        """Extract state and questions from the incoming request."""
+        state = request.get("state", "")
+        questions = request.get("questions", {})
+        if not state:
+            raise ValueError("Request must contain a 'state' field")
+        if not questions:
+            raise ValueError("Request must contain a 'questions' field")
+        return state, questions
 
-    def predict(self, prompt: str) -> dict[str, Any]:
-        """Run inference on the prompt."""
+    def predict(self, state: str, questions: dict[str, Any]) -> dict[str, Any]:
+        """Run inference on the state with questions."""
         try:
-            probabilities = self._model.predict(prompt)
-            score = self._model.score(prompt)
+            result = self._model.predict(state, questions)
             return {
-                "probabilities": probabilities,
-                "score": score,
+                "answers": result.get("answers", {}),
+                "routing": result.get("routing", {}),
             }
         except Exception as exc:
             logger.error("Inference failed: %s", exc)
             return {
-                "probabilities": {},
-                "score": 0.5,
+                "answers": {},
+                "routing": {},
                 "error": str(exc),
             }
 
     def encode_response(self, output: dict[str, Any]) -> dict[str, Any]:
         """Return the response as-is (already JSON-serializable)."""
         return output
-
-
-class LayaBatchAPI(ls.LitAPI):
-    """LitServe API for batch inference."""
-
-    def setup(self, device: str) -> None:
-        """Load the model on startup."""
-        logger.info("Setting up LayaBatchAPI on device: %s", device)
-        self._model = get_model()
-        self._model.load()
-
-    def decode_request(self, request: dict[str, Any]) -> list[str]:
-        """Extract prompts from the incoming request."""
-        prompts = request.get("prompts", [])
-        if not prompts:
-            raise ValueError("Request must contain a 'prompts' field with a non-empty list")
-        return prompts
-
-    def predict(self, prompts: list[str]) -> list[dict[str, Any]]:
-        """Run inference on a batch of prompts."""
-        results: list[dict[str, Any]] = []
-        for prompt in prompts:
-            try:
-                probabilities = self._model.predict(prompt)
-                score = self._model.score(prompt)
-                results.append({
-                    "probabilities": probabilities,
-                    "score": score,
-                })
-            except Exception as exc:
-                logger.error("Inference failed for prompt: %s", exc)
-                results.append({
-                    "probabilities": {},
-                    "score": 0.5,
-                    "error": str(exc),
-                })
-        return results
-
-    def encode_response(self, output: list[dict[str, Any]]) -> dict[str, Any]:
-        """Wrap the batch results."""
-        return {"results": output}
 
 
 def main() -> None:
