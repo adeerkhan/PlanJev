@@ -8,7 +8,10 @@ import uuid
 
 from .model_loader import LayaModel, get_model
 from .schemas import (
+    CandidateDecision,
     CandidateScore,
+    DecideRequest,
+    DecideResponse,
     DecisionRequest,
     DecisionResponse,
     LayoutCandidate,
@@ -27,6 +30,27 @@ INCOMPATIBLE_ZONES = {
     (ZoneType.INDUSTRIAL, ZoneType.RESIDENTIAL),
     (ZoneType.INDUSTRIAL, ZoneType.GREEN),
     (ZoneType.UTILITY, ZoneType.RESIDENTIAL),
+}
+
+# The "logic" half of a decide call: typed questions the model answers for
+# every candidate state. Callers may override per request; these defaults
+# cover the two judgments a floorplan portfolio is ranked by.
+DEFAULT_DECIDE_QUESTIONS: dict[str, dict] = {
+    "layout_quality": {
+        "type": "score",
+        "instructions": (
+            "How good is this floorplan arrangement overall: room proportions, "
+            "adjacency relationships, daylight access, and use of the site"
+        ),
+        "criteria": ["poor", "below average", "average", "good", "excellent"],
+    },
+    "is_buildable": {
+        "type": "noul",
+        "instructions": (
+            "The layout is buildable and usable as drawn: rooms do not overlap, "
+            "every room is reachable, and service rooms are practically placed"
+        ),
+    },
 }
 
 
@@ -91,6 +115,61 @@ class DecisionEngine:
             warnings=warnings,
             scores=scores,
         )
+
+    def decide(self, request: DecideRequest) -> DecideResponse:
+        """Return calibrated probabilities for every candidate in one batch.
+
+        This is the System One path: no ranking heuristics on our side, just
+        a state per candidate and the caller's typed questions. Inference
+        failures propagate (the HTTP layer maps them to 503) so a caller
+        never mistakes a fallback constant for a real probability.
+        """
+        start = time.perf_counter()
+        request_id = str(uuid.uuid4())[:8]
+        questions = request.questions or DEFAULT_DECIDE_QUESTIONS
+
+        states = [self._build_model_state(request.brief, c) for c in request.candidates]
+        results = self._model.predict_batch(states, questions)
+
+        decisions = [
+            CandidateDecision(
+                candidate_id=candidate.candidate_id,
+                model_score=self._answers_to_score(result.get("answers", {}), questions),
+                answers=result.get("answers", {}),
+            )
+            for candidate, result in zip(request.candidates, results, strict=True)
+        ]
+        decisions.sort(key=lambda d: d.model_score, reverse=True)
+
+        elapsed = (time.perf_counter() - start) * 1000
+        return DecideResponse(
+            request_id=request_id,
+            decisions=decisions,
+            model_used=self._model.model_id,
+            inference_time_ms=round(elapsed, 2),
+        )
+
+    @staticmethod
+    def _answers_to_score(answers: dict, questions: dict) -> float:
+        """Collapse typed answers to one 0..1 scalar: prefer a normalized
+        score answer (expected criteria index / (k-1)), else the mean noul
+        probability, else neutral 0.5."""
+        for qid, answer in answers.items():
+            if not isinstance(answer, dict) or answer.get("type") != "score":
+                continue
+            criteria = questions.get(qid, {}).get("criteria") or answer.get("legend") or {}
+            k = len(criteria)
+            if k > 1 and "score" in answer:
+                return max(0.0, min(1.0, float(answer["score"]) / (k - 1)))
+
+        nouls = [
+            float(answer["noul"])
+            for answer in answers.values()
+            if isinstance(answer, dict) and "noul" in answer
+        ]
+        if nouls:
+            return max(0.0, min(1.0, sum(nouls) / len(nouls)))
+        return 0.5
 
     # ── Private scoring methods ────────────────────────────────────────────
 
@@ -284,12 +363,22 @@ class DecisionEngine:
             return 0.5
 
     def _build_model_state(self, brief: ProjectBrief, candidate: LayoutCandidate) -> str:
-        """Build a text state description for the model."""
+        """Build a text state description for the model.
+
+        The state carries both the data (site, placements) and the logic the
+        layout must satisfy (the brief's adjacency requirements), so one
+        forward pass can judge how well the arrangement meets the programme
+        rather than only how tidy the geometry looks.
+        """
         lines = [
             f"Site: {brief.site.width_m}m x {brief.site.depth_m}m",
             f"Rooms: {len(brief.rooms)}",
-            "Layout:",
         ]
+        requirements = self._requirement_lines(brief)
+        if requirements:
+            lines.append("Requirements:")
+            lines.extend(requirements)
+        lines.append("Layout:")
         for room in brief.rooms:
             placement = candidate.room_placements.get(room.id)
             if placement:
@@ -301,6 +390,21 @@ class DecisionEngine:
             else:
                 lines.append(f"  {room.name} ({room.zone_type.value}): NOT PLACED")
         return "\n".join(lines)
+
+    @staticmethod
+    def _requirement_lines(brief: ProjectBrief) -> list[str]:
+        """One line per stated adjacency requirement, room ids named as rooms."""
+        names = {room.id: room.name for room in brief.rooms}
+        lines: list[str] = []
+        for room in brief.rooms:
+            label = names.get(room.id, room.id)
+            for target in room.must_be_adjacent:
+                lines.append(f"  {label} must adjoin {names.get(target, target)}")
+            for target in room.preferred_adjacent:
+                lines.append(f"  {label} should adjoin {names.get(target, target)}")
+            for target in room.must_not_be_adjacent:
+                lines.append(f"  {label} must NOT adjoin {names.get(target, target)}")
+        return lines
 
     # ── Private validation methods ─────────────────────────────────────────
 

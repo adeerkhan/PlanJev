@@ -5,12 +5,16 @@ from __future__ import annotations
 import logging
 import os
 from contextlib import asynccontextmanager
+from pathlib import Path
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from engine.decision_engine import get_engine
 from engine.schemas import (
+    DecideRequest,
+    DecideResponse,
     DecisionRequest,
     DecisionResponse,
     ValidationRequest,
@@ -22,6 +26,13 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+# .env is the documented config surface (PORT, MODEL_CACHE_DIR,
+# DECISION_MODEL, CORS_ORIGINS, ...). Nothing loaded it, so those settings
+# silently did nothing unless they were exported by hand. The path is the
+# backend's own, not the process CWD: `uvicorn api.main:app` from anywhere
+# must still pick up the same file.
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 
 @asynccontextmanager
@@ -79,6 +90,23 @@ async def validate_layout(request: ValidationRequest) -> ValidationResponse:
     """Validate a single layout candidate."""
     engine = get_engine()
     return engine.validate_layout(request)
+
+
+@app.post("/api/v1/decide", response_model=DecideResponse)
+async def decide_layouts(request: DecideRequest) -> DecideResponse:
+    """Return calibrated probabilities for every candidate (one batched pass).
+
+    503 when model inference is unavailable: the caller ranks deterministically
+    instead of receiving fabricated probabilities.
+    """
+    if not request.candidates:
+        raise HTTPException(status_code=400, detail="At least one candidate is required")
+    engine = get_engine()
+    try:
+        return engine.decide(request)
+    except Exception as exc:  # model load / inference failure — not a client error
+        logger.warning("Decision inference failed: %s", exc)
+        raise HTTPException(status_code=503, detail=f"model inference unavailable: {exc}")
 
 
 @app.get("/v1/models")

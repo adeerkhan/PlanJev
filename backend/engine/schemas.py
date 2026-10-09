@@ -122,3 +122,33 @@ class ValidationResponse(BaseModel):
     violations: list[str]
     warnings: list[str]
     scores: dict[str, float]
+
+
+# ── Probability (decide) Schemas ─────────────────────────────────────────────
+
+class DecideRequest(BaseModel):
+    """Batched probability request: the same typed questions evaluated
+    against many layout states in one forward pass."""
+    brief: ProjectBrief
+    candidates: list[LayoutCandidate]
+    # qid -> {type: noul|score|choice, instructions, criteria?}; None = engine defaults.
+    questions: dict[str, dict[str, Any]] | None = None
+
+
+class CandidateDecision(BaseModel):
+    """Raw model probabilities for one candidate."""
+    candidate_id: str
+    # Scalar 0..1 fused from the answers (a score answer normalized by its
+    # criteria count, else the mean noul probability), for ranking.
+    model_score: float = Field(ge=0, le=1)
+    # Laya's typed answers verbatim: per-question noul/score/choice
+    # probabilities with their confidence values.
+    answers: dict[str, Any]
+
+
+class DecideResponse(BaseModel):
+    """Probabilities for every candidate, ranked best-first by model_score."""
+    request_id: str
+    decisions: list[CandidateDecision]
+    model_used: str
+    inference_time_ms: float
