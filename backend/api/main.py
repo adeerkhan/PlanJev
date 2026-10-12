@@ -43,6 +43,7 @@ async def lifespan(app: FastAPI):
     try:
         engine._model.load()
         logger.info("Model pre-loaded successfully")
+        logger.info("Decision batch limit: %d candidate(s)", engine.max_candidates())
     except Exception as exc:
         logger.warning("Model pre-load failed (will retry on first request): %s", exc)
     yield
@@ -66,13 +67,15 @@ app.add_middleware(
 
 
 @app.get("/health")
-async def health_check() -> dict[str, str | bool]:
+async def health_check() -> dict[str, str | bool | int]:
     """Health check endpoint."""
     engine = get_engine()
     return {
         "status": "ok",
         "model_loaded": engine._model.is_loaded,
         "model_id": engine._model.model_id,
+        # Candidates the model can judge in one batched pass on this GPU.
+        "max_candidates": engine.max_candidates(),
     }
 
 
@@ -104,6 +107,8 @@ async def decide_layouts(request: DecideRequest) -> DecideResponse:
     engine = get_engine()
     try:
         return engine.decide(request)
+    except ValueError as exc:  # the caller asked for more than the GPU holds
+        raise HTTPException(status_code=413, detail=str(exc))
     except Exception as exc:  # model load / inference failure — not a client error
         logger.warning("Decision inference failed: %s", exc)
         raise HTTPException(status_code=503, detail=f"model inference unavailable: {exc}")

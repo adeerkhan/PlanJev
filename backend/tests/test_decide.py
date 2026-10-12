@@ -302,6 +302,20 @@ class _FakeDecider:
         return {"model": self.name, "answers": self._answers(questions)}
 
 
+class TestBatchLimit:
+    """An oversized batch is refused before the GPU sees it."""
+
+    def test_decide_rejects_a_batch_above_the_limit(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(DecisionEngine, "max_candidates", lambda self: 2)
+        brief = ProjectBrief(
+            project_id="limit", site=SiteBrief(width_m=10.0, depth_m=12.0),
+            rooms=[RoomSpec(id="a", name="A", zone_type=ZoneType.RESIDENTIAL, target_area_m2=10.0)],
+        )
+        candidates = [LayoutCandidate(candidate_id=str(i), room_placements={"a": {"x": i, "y": 0, "w": 2, "h": 2}}) for i in range(3)]
+        with pytest.raises(ValueError, match="exceeds this service's limit of 2"):
+            DecisionEngine().decide(DecideRequest(brief=brief, candidates=candidates))
+
+
 class TestDeciderModel:
     """decider-2b is a drop-in: same questions in, same answer shapes out."""
 
@@ -341,6 +355,29 @@ class TestDeciderModel:
         assert DecisionEngine._answers_to_score(
             out[0]["answers"], DEFAULT_DECIDE_QUESTIONS
         ) == pytest.approx(0.75)
+
+    def test_one_candidate_requests_take_the_single_state_path(self) -> None:
+        """Guidance traffic is one candidate per request, and it must not
+        compile a schema: a fresh schema + CUDA graphs per distinct question
+        set is what used to strand VRAM until the service 503'd mid-run."""
+        model, fake = self._model()
+
+        out = model.predict_batch(["state a"], DEFAULT_DECIDE_QUESTIONS)
+
+        assert fake.schema_calls == []
+        assert fake.system_one_calls == ["state a"]
+        assert out[0]["answers"]["is_buildable"]["noul"] == 0.9
+
+    def test_batches_still_compile_the_schema_once(self) -> None:
+        """The portfolio shape (many candidates, fixed questions) keeps the
+        one-pass batched path."""
+        model, fake = self._model()
+
+        out = model.predict_batch(["state a", "state b"], DEFAULT_DECIDE_QUESTIONS)
+
+        assert fake.schema_calls == [DEFAULT_DECIDE_QUESTIONS]
+        assert fake.system_one_calls == []
+        assert len(out) == 2
 
     def test_predict_scores_a_single_state(self) -> None:
         model, _ = self._model()

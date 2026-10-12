@@ -116,6 +116,10 @@ class DecisionEngine:
             scores=scores,
         )
 
+    def max_candidates(self) -> int:
+        """How many candidates the configured model can judge in one batch."""
+        return self._model.max_batch_candidates()
+
     def decide(self, request: DecideRequest) -> DecideResponse:
         """Return calibrated probabilities for every candidate in one batch.
 
@@ -124,6 +128,16 @@ class DecisionEngine:
         failures propagate (the HTTP layer maps them to 503) so a caller
         never mistakes a fallback constant for a real probability.
         """
+        # The batch is one GPU forward pass and VRAM is shared, so refuse an
+        # oversized request before the attempt: a failed pass reserves CUDA
+        # graph pools that make even a small batch fail afterwards.
+        limit = self.max_candidates()
+        if len(request.candidates) > limit:
+            raise ValueError(
+                f"batch of {len(request.candidates)} candidates exceeds this "
+                f"service's limit of {limit} (GET /health reports max_candidates)"
+            )
+
         start = time.perf_counter()
         request_id = str(uuid.uuid4())[:8]
         questions = request.questions or DEFAULT_DECIDE_QUESTIONS
@@ -376,19 +390,25 @@ class DecisionEngine:
         ]
         requirements = self._requirement_lines(brief)
         if requirements:
-            lines.append("Requirements:")
+            # Blank lines between the sections: each is its own paragraph,
+            # which keeps the sentence count per paragraph inside the STE
+            # rules and reads better to a small model.
+            lines.extend(["", "Requirements:"])
             lines.extend(requirements)
-        lines.append("Layout:")
+        lines.extend(["", "Layout:"])
+        # The placements are a list, not prose: one item per room keeps each
+        # entry its own statement (STE rule 6.6 caps prose paragraphs at six
+        # sentences) and reads as a list to the model.
         for room in brief.rooms:
             placement = candidate.room_placements.get(room.id)
             if placement:
                 lines.append(
-                    f"  {room.name} ({room.zone_type.value}): "
+                    f"- {room.name} ({room.zone_type.value}): "
                     f"({placement.get('x', 0):.1f}, {placement.get('y', 0):.1f}) "
                     f"{placement.get('w', 0):.1f}m x {placement.get('h', 0):.1f}m"
                 )
             else:
-                lines.append(f"  {room.name} ({room.zone_type.value}): NOT PLACED")
+                lines.append(f"- {room.name} ({room.zone_type.value}): NOT PLACED")
         return "\n".join(lines)
 
     @staticmethod

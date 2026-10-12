@@ -24,7 +24,7 @@ backend/
 
 ```bash
 # Activate the uv environment
-source jev/bin/activate
+source .venv/bin/activate
 
 # Run FastAPI server (port 8000)
 uvicorn api.main:app --host 0.0.0.0 --port 8000
@@ -80,7 +80,7 @@ cache means no re-download.
 GPUs) — CPU torch works but is ~100× slower per batch:
 
 ```bash
-uv pip install --python jev/bin/python torch==2.14.1+cu130 \
+uv pip install --python .venv/bin/python torch==2.14.1+cu130 \
   --index-url https://download.pytorch.org/whl/cu130
 ```
 
@@ -88,31 +88,96 @@ uv pip install --python jev/bin/python torch==2.14.1+cu130 \
 the fused Qwen3.5 kernels; without them the model runs but several times
 slower.
 
-### Measured on an 8 GB laptop GPU (RTX 5060, shared with the desktop)
+### VRAM: the batch is a hard limit
 
-| candidates per request | latency (warm) | VRAM peak |
-|---|---|---|
-| 2 | ~430 ms | ~4.4 GB |
-| 4 | ~900 ms | ~5.0 GB |
-| 5+ | OOM → HTTP 503; the solve keeps its deterministic ranking | — |
+The batch is one GPU forward pass, and the card is shared with the desktop,
+so the number of candidates a request may carry is a property of the
+machine. `DECISION_MAX_CANDIDATES` (default **2**, measured on an 8 GB
+laptop card) is the limit; `GET /health` reports it as `max_candidates`,
+and the solver client asks for it and caps its batch automatically.
 
-The model itself (bf16 weights + CUDA-graph pools) is ~5.8 GB, so the batch
-is the only free variable: the solver client therefore sends only the
-portfolio's **top 4** plans (`DecisionModelConfig.maxCandidates` — raise it
-on a bigger card). An OOM releases the caching allocator before the error
-propagates, so one oversized request never poisons the process. In-process
-fp8 conversion is not an option on an 8 GB card: quantising needs 2x the
-weights in VRAM.
+A request above the limit is refused with **413** and a message naming the
+limit — before the GPU is touched. That is deliberate: a batch that fails
+mid-forward reserves CUDA-graph pools, which makes even a small batch fail
+afterwards. If a batch that was within the limit still runs out (the desktop
+took memory back), the limit lowers itself and the allocator's blocks are
+reclaimed, so the next request succeeds.
+
+Raise it on a dedicated GPU:
+
+    DECISION_MAX_CANDIDATES=8
+
+```
+$ curl -s localhost:8000/health
+{"status":"ok","model_loaded":true,"model_id":"Mapika/decider-2b","max_candidates":2}
+```
+
+#### One-candidate requests are pinned to the single-state path
+
+Guidance traffic (the solver asking which room to place next) sends exactly
+**one** candidate per request, with the options inside the question — and the
+question text changes on every call, because it states the residual free area
+and the room ids on offer. The schema path used to compile a fresh schema and
+capture fresh CUDA graphs per distinct question set, so a corpus run's hundreds
+of guidance requests grew the graph pool until even one-candidate requests
+503'd, and the service only recovered on a restart. Requests carrying a single
+candidate now score through the engine's shape-keyed graphs (one bounded set,
+shared by every request) instead. Multi-candidate batches — the portfolio
+re-rank, whose questions are fixed — keep the one-pass batched path.
 
 ### A/B the backends
 
 ```bash
-MODEL_CACHE_DIR=.model_cache ./jev/bin/python scripts/ab_models.py
+MODEL_CACHE_DIR=.model_cache ./.venv/bin/python scripts/ab_models.py
 ```
 
 Loads each backend in turn, scores the same four layout candidates with the
 same questions, and prints load time, batched latency, and the per-candidate
 probabilities side by side.
+
+## What the model can and cannot do (measured)
+
+The decision model is a judge, not a generator: it answers questions about
+states you hand it and cannot emit coordinates. Three measurements on this
+service, with the numbers they produced:
+
+| question | result | verdict |
+|---|---|---|
+| Can it rank a **complete** layout? | good `0.698` vs bad `0.568` (Δ0.13) | yes |
+| Can it rank a **partial** layout? | promising `0.500` vs doomed `0.515` (Δ0.015); with the residual void described in the input, **backwards** (`0.333` vs `0.433`) | no — it cannot see the residual space we do not put in the state |
+| Does its ranking agree with the solver's exact score? | mean Spearman **0.188** over 7 corpus programmes (range +0.895 to −0.684); 6/7 winners differ, always by near-tie margins | no — uncorrelated |
+| If it drives the solver's room ORDER (`packages/solver/bench/guided-ordering.ts`) | model-greedy `0.7297` vs score-greedy `0.7781` mean over 5 programmes, 116 decisions: −0.048 on average, one case +0.050 | signal, but not reliable |
+
+Consequences for how this service is used: keep it on the cold path, judging
+plans the solver has already built (fused ranking, tie-breaking,
+explainability). Do **not** let it prune the search or steer generation — it
+is asked about partial states there, which it cannot judge, and the exact
+geometry it would be paraphrasing is cheaper and exact.
+
+Scripts: `scripts/probe_partial.py`, `scripts/probe_void.py`,
+`scripts/ste_state_check.py`, `scripts/ab_models.py`. TS benches:
+`packages/solver/bench/judge-calibration.ts` and
+`packages/solver/bench/guided-ordering.ts`.
+
+## The state text obeys Simplified Technical English
+
+The model reads the state as plain text, and it is small (2B). Its
+comprehension is therefore a function of how the text is written, so the
+state is checked against the STE writing rules — short paragraphs, one idea
+per sentence, no stacked clauses — rather than treated as prose:
+
+- `tools/ste/ste_check.py` is the checker, vendored from
+  [simplified-technical-english](https://github.com/adeerkhan/simplified-technical-english)
+  (MIT for the tool; the word list is ASD's, see `tools/ste/NOTICE.md`).
+- `tests/test_state_text.py` fails when a state or a default question
+  breaks a rule, so the text cannot drift into long sentences.
+- `scripts/ste_state_check.py` prints a state and its rule report:
+
+      ./.venv/bin/python scripts/ste_state_check.py
+
+Only the structural rules are enforced: room and zone names are technical
+nouns the approved-word list does not carry, so a full dictionary check
+would fail on `residential` and `utility`.
 
 ## Development
 

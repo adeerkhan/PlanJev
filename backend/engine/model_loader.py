@@ -51,6 +51,26 @@ def _collapse_to_score(result: dict[str, Any], question: dict[str, Any]) -> floa
     return 0.5
 
 
+def _ensure_gpu_scratch_space() -> None:
+    """Keep Triton's compile scratch space off a full system temp disk.
+
+    decider-2b's fused Qwen3.5 kernels are compiled by Triton on first use.
+    Triton defaults `TMPDIR`/`TRITON_CACHE_DIR` to the system temp dir, which
+    on many desktops is a small tmpfs; when it fills, compilation fails and
+    the kernels SILENTLY fall back to slow CPU ones (the log says "roll back
+    to CPU"). Both point at backend/.tmp on the project disk instead, so the
+    fast kernels compile and stay cached across restarts.
+
+    `os.environ.setdefault` lets an explicit setting win. TMPDIR is read by
+    the C compiler Triton spawns as a child of this process, so setting it
+    here is early enough for the load below.
+    """
+    scratch = Path(__file__).resolve().parent.parent / ".tmp"
+    os.environ.setdefault("TMPDIR", str(scratch))
+    os.environ.setdefault("TRITON_CACHE_DIR", str(scratch / "triton"))
+    (scratch / "triton").mkdir(parents=True, exist_ok=True)
+
+
 def _apply_cache_dir() -> None:
     """Honour MODEL_CACHE_DIR (see .env.example) for the HF cache.
 
@@ -86,6 +106,10 @@ class LayaModel:
     @property
     def is_loaded(self) -> bool:
         return self._loaded
+
+    def max_batch_candidates(self) -> int:
+        """Laya is 421M on CPU: batches far larger than any portfolio."""
+        return MAX_BATCH_CANDIDATES
 
     def load(self) -> None:
         """Load the Laya model."""
@@ -155,16 +179,30 @@ class DeciderModel:
     def __init__(self) -> None:
         self.model_id = DECIDER_MODEL_ID
         self._decider: Any = None
+        self._batch_limit = MAX_BATCH_CANDIDATES
 
     @property
     def is_loaded(self) -> bool:
         return self._decider is not None
+
+    def max_batch_candidates(self) -> int:
+        """Candidates the model can judge in one GPU pass right now.
+
+        Starts at `DECISION_MAX_CANDIDATES` (default %d, measured on a
+        shared 8 GB laptop card: the weights, the CUDA-graph pools and the
+        Triton workspace take most of it) and only ever LOWERS itself, when
+        a real batch runs out of memory. It never probes upward: a batch
+        that happens to fit while the desktop is idle captures graph pools
+        that then make the next, larger request fail.
+        """ % MAX_BATCH_CANDIDATES
+        return self._batch_limit
 
     def load(self) -> None:
         if self._decider is not None:
             return
 
         _apply_cache_dir()
+        _ensure_gpu_scratch_space()
         logger.info("Loading decider model from %s", self.model_id)
 
         import sys
@@ -210,17 +248,32 @@ class DeciderModel:
         assert self._decider is not None
         if getattr(self._decider, "eng", None) is None:
             return [self._decider.system_one(state, questions) for state in states]
+        # A one-candidate request is guidance traffic: the solver asks about a
+        # single partial plan, with the options inside the question. The schema
+        # path compiles a fresh schema and captures fresh CUDA graphs per
+        # distinct question set, and the question text changes on every call
+        # (it states the residual free area and the room ids on offer) — so a
+        # corpus run's hundreds of guidance requests grow the graph pool until
+        # even this shape 503s, and the service only recovers on a restart.
+        # The single-state path scores through the engine's shape-keyed graphs
+        # instead: one bounded set, shared by every request. (This also pins
+        # single-candidate /api/v1/score requests to the same path — same
+        # answer shapes, so the endpoint contract is unchanged.)
+        if len(states) == 1:
+            return [self._decider.system_one(states[0], questions)]
         import torch  # already imported by load(); needed for the OOM guard
 
-        schema = self._decider.schema(questions)
         try:
+            # The schema compile captures CUDA graphs and allocates, so a
+            # batch too big for the card can fail here as well as in batch().
+            schema = self._decider.schema(questions)
             out = schema.batch(list(states))
         except torch.cuda.OutOfMemoryError:
-            # Release the caching allocator's reserved blocks before
-            # re-raising. Without this one oversized batch strands the
-            # memory for the process's lifetime: every later request,
-            # including smaller ones, would fail the same way.
+            # VRAM is shared and moves. Report the smaller size from now on,
+            # and reclaim the allocator's blocks before the error travels,
+            # or every later request fails the same way.
             torch.cuda.empty_cache()
+            self._batch_limit = min(self._batch_limit, max(1, len(states) - 1))
             raise
         # Hand the allocator's idle blocks back between requests. On a card
         # shared with a desktop this is the difference between a small
@@ -233,6 +286,10 @@ class DeciderModel:
         question = question or DEFAULT_SCORE_QUESTION
         return _collapse_to_score(self.predict(state, {"overall": question}), question)
 
+
+# Candidates judged in one GPU pass. Two is what a shared 8 GB card holds
+# alongside a desktop; raise DECISION_MAX_CANDIDATES on a dedicated GPU.
+MAX_BATCH_CANDIDATES = max(1, int(os.getenv("DECISION_MAX_CANDIDATES", "2")))
 
 # Registry of backends, keyed by the DECISION_MODEL value.
 BACKENDS: dict[str, type[LayaModel] | type[DeciderModel]] = {

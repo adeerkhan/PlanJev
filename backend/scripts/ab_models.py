@@ -1,8 +1,8 @@
 """Benchmark one decision-model backend on the SAME layout states.
 
     cd backend
-    MODEL_CACHE_DIR=.model_cache ./jev/bin/python scripts/ab_models.py laya
-    MODEL_CACHE_DIR=.model_cache ./jev/bin/python scripts/ab_models.py decider-2b
+    MODEL_CACHE_DIR=.model_cache ./.venv/bin/python scripts/ab_models.py laya
+    MODEL_CACHE_DIR=.model_cache ./.venv/bin/python scripts/ab_models.py decider-2b
 
 Loads the chosen backend (laya or decider-2b; default laya), scores the same
 four candidates with the same typed questions, and reports load time,

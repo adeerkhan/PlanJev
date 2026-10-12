@@ -141,6 +141,7 @@ jev/
 
 # ── Model Cache ──────────────────────────────────────────────────────────────
 .model_cache/
+.tmp/
 *.safetensors
 *.bin
 *.pt
